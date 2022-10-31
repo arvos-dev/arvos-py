@@ -1,37 +1,107 @@
 #!/usr/bin/python3
 import subprocess
 import argparse
-import datetime
 import signal
 import time
+import requests
 import json
 import csv
 import sys
+import ast
 import re
+import os
 import ctypes as ct
 
 from bcc import BPF, USDT
-#from pip_requirements_parser import RequirementsFile
+from packaging.specifiers import SpecifierSet
+from pip_requirements_parser import RequirementsFile
 
-
+DOCKER_RUNNING = True if os.environ.get('APP_ENV') == 'docker' else False
+MAX_HTTP_RETRIES = 2
 STACK_COUNT = 256
 STACK_SIZE  = 256
 PERIOD = 10
-time.sleep(5)
+
+OPERATORS = {
+    "gt": ">",
+    "gte": ">=",
+    "lt": "<",
+    "lte": "<="
+}
 
 def signal_handler(signal, frame):
     global interrupted
     interrupted = True
 
+
+vulnerability_scores = {}
+def get_vulnerability_score(cve):
+    global vulnerability_scores
+
+    if not cve.startswith('CVE'):
+        return "None"
+
+    if cve in vulnerability_scores:
+        return vulnerability_scores[cve]
+
+    for _ in range(MAX_HTTP_RETRIES):
+        if (cve.startswith('CVE')):
+            res = requests.get(f"https://services.nvd.nist.gov/rest/json/cve/1.0/{cve}?apiKey=5cb1bbbd-9b0f-487e-a7db-06f642f91a5a")
+            if res.status_code == 200:
+                vulnerability_scores[cve] = res.json()['result']['CVE_Items'][0]['impact']['baseMetricV3']['cvssV3']['baseSeverity']
+                return vulnerability_scores[cve]
+        elif (cve.startswith('GHSA')):
+            github_api_token = os.environ.get("GITHUB_API_TOKEN")
+            query = "query { securityAdvisory(ghsaId:" + f'"{cve}"' + ") { severity }}"
+            headers = {"Authorization": f"Bearer {github_api_token}"}
+            res = requests.post("https://api.github.com/graphql", json={"query": query}, headers=headers)
+            if res.ok:
+                severity = res.json()['data']['securityAdvisory']['severity']
+                severity = 'MEDIUM' if severity == 'MODERATE' else severity
+                vulnerability_scores[cve] = severity
+                return severity
+
+    return "None"
+
+def get_version_range(vuln):
+    if 'package_version_range' not in vuln:
+        return ''
+
+    version_range = list(filter(lambda e: e[1] != '~', vuln['package_version_range'].items()))
+    if not version_range:
+        version_range = list(filter(lambda e: e[1] != '~', vuln['cpe_version_range'].items()))
+
+    return ",".join(map(lambda e: OPERATORS[e[0]] + e[1], version_range))
+
 def filter_vulnerabilities(vulnerability_database, req_file):
     relevant_vulnerabilites = []
-    for req in req_file:
-        for vulnerability in vulnerability_database:
-            # TODO(No version information in db)
-            # TODO(No package name in db)
-            #if vulnerability['package'] == req.name and vulnerability['version'] in req.specifier:
-            #    pass
-            pass
+    unpinned_requirements = set()
+
+    for vuln in vulnerability_database:
+        specifier_set = SpecifierSet(get_version_range(vuln))
+        
+        for req in req_file.requirements:
+            # No package name in current db
+            if req.name.lower() == vuln['repository'].split('/')[-1]:
+                if req.is_pinned:
+                    for version in req.specifier:
+                        if version.version in specifier_set:
+                            relevant_vulnerabilites.append(vuln)
+                            break
+                else:
+                    unpinned_requirements.add(req.name)
+                    relevant_vulnerabilites.append(vuln)
+                
+                break
+        else:
+            # Keep vulnerabilites without match in req file?
+            relevant_vulnerabilites.append(vuln)
+
+        
+    for req_name in unpinned_requirements:
+        print(f"{bcolors.WARNING}Version of library {req_name} is not pinned. Can't filter relevant database entries.\n{bcolors.ENDC}")
+    
+    return relevant_vulnerabilites
 
 def find_repeating_sequence(seq):
     guess = 0
@@ -84,6 +154,34 @@ def get_formated_stack_trace(stack_trace):
 
     return formated_stack_trace
 
+class NodeVisitor(ast.NodeVisitor):
+    def __init__(self, class_name, function_name, lineno):
+        self.class_name = class_name
+        self.function_name = function_name
+        self.lineno = lineno
+
+        self.match_found = False
+
+    def visit_ClassDef(self, node):
+        if node.name == self.class_name:
+            self.generic_visit(node)
+
+    def visit_FunctionDef(self, node):
+        if node.name == self.function_name and node.lineno == self.lineno:
+            self.match_found = True
+
+def match_exact_function(filename, symbol_class, function_name, lineno):
+    if DOCKER_RUNNING:
+        filename = f'/proc/{args.pid}/root' + filename
+    
+    with open(filename) as fp:
+        tree = ast.parse(fp.read())
+
+    visitor = NodeVisitor(symbol_class.split('.')[-1], function_name, lineno)
+    visitor.visit(tree)
+    
+    return visitor.match_found
+
 # Text colors
 class bcolors:
     HEADER = '\033[95m'
@@ -98,9 +196,10 @@ class bcolors:
 
 parser = argparse.ArgumentParser(description="Summarize method calls in high-level languages.")
 parser.add_argument("pid", type=int, nargs="?", help="process id to attach to")
-parser.add_argument("--detect", action="store_true", help="automatically fetch pid")
+parser.add_argument("--detect", type=str, help="automatically fetch pid")
 parser.add_argument("--debug", action="store_true", help="debug mode")
 parser.add_argument('--save-report', default=False, const=False, nargs='?', choices=['csv'], help='Save report as csv')
+parser.add_argument("--database-file", type=str, default='arvos_vfs_py.json', help="Specify database file")
 parser.add_argument("--requirements-file", type=str, help="Provide library version through requirements.txt")
 parser.add_argument("--trace-period", help="Tracing period in minutes (default: Infinite)", type=int, default=sys.maxsize, required=False)
 
@@ -112,22 +211,32 @@ if not args.debug:
 
 if not args.pid and not args.detect:
     print("Must either provide PID or use --detect")
-    exit()
+    sys.exit(1)
 
-if not args.pid and args.detect:    
-    try:
-        args.pid = int(subprocess.Popen(['pgrep', '-f', '/python3 manage.py runserver'], stdout=subprocess.PIPE).communicate()[0].decode().split('\n')[0])
-    except:
-        print("Could not automatically detect pid")
-        exit()
+if not args.pid and args.detect:
+    for i in range(10):
+        "ps ax | grep -v -e 'python_calls.py' -e 'grep' | grep '/python3 manage.py runserver'"
+        p1 = subprocess.Popen(['ps', 'ax'], stdout=subprocess.PIPE)
+        p2 = subprocess.Popen(['grep', '-v', '-e', 'python_calls.py', '-e', 'grep'], stdin=p1.stdout, stdout=subprocess.PIPE)
+        p3 = subprocess.Popen(['grep', args.detect], stdin=p2.stdout, stdout=subprocess.PIPE)
+        pid = p3.communicate()[0].decode().split()
+        if pid:
+            args.pid = int(pid[0])
+            break
+
+        time.sleep(5)
+    else:
+        print(f"{bcolors.FAIL}[ERROR]{bcolors.ENDC} Could not automatically detect pid")
+        sys.exit(1)
+
 
 stacks_str = ""
 for i in range(STACK_COUNT):
     stacks_str += f"BPF_ARRAY(array{i}, struct hash_t, {STACK_SIZE});\n"
 
 program = '''
-#define MAX_CLASS_LENGTH  130
-#define MAX_METHOD_LENGTH 50
+#define MAX_CLASS_LENGTH  150
+#define MAX_METHOD_LENGTH 100
 DEFINE_STACK_SIZE
 
 DEFINE_DEBUG
@@ -354,15 +463,14 @@ for i in range(STACK_COUNT):
     stack_map[ct.c_int(i)] = ct.c_int(bpf[f"array{i}"].map_fd)
     
 
-with open('arvos_vfs_py.json') as fp:
+with open(args.database_file) as fp:
     vulnerability_database = json.load(fp)
 
 if not args.requirements_file:
     print(f"{bcolors.WARNING}requirements file not provided. Version filtering cannot be performed. This will increase the number of false positives.\n{bcolors.ENDC}")
 else:
-    #req_file = RequirementsFile.from_file(args['requirements-file'])
-    #vulnerability_database = filter_vulnerabilities(vulnerability_database, req_file)
-    pass
+    req_file = RequirementsFile.from_file(args.requirements_file)
+    vulnerability_database = filter_vulnerabilities(vulnerability_database, req_file)
 
 print(f"{bcolors.OKGREEN}Tracing calls in process {args.pid} (language: python)... Ctrl-C to quit.{bcolors.ENDC}")
 interrupted = False
@@ -384,13 +492,13 @@ if args.debug:
             sys.exit(0)
 
 seen = []
+pattern = 'python\d\.\d{1,2}\/(site-packages\/|dist-packages\/|)(.+).py'
 vuln_count = 0
-TRACE_TIME = args.trace_period * (60 / PERIOD)
-while TRACE_TIME > 0:
+TRACE_TIME = args.trace_period * 60
+start_time = time.time()
+while TRACE_TIME > time.time() - start_time:
     time.sleep(PERIOD)
-    TRACE_TIME -= 1
 
-    pattern = 'python\d\.\d{1,2}\/(site-packages\/|dist-packages\/|)(.+).py'
     for vulnerability in vulnerability_database:
         for symbol in vulnerability['symbols']:
             for k,v in bpf['counts'].items():
@@ -402,24 +510,26 @@ while TRACE_TIME > 0:
                 if result:
                     traced_class = result.group(2).replace('/','.')
 
-                if result and symbol['class_name'].startswith(traced_class) and method == symbol['method_name']:
+                if result and symbol['class_name'].startswith(traced_class) and \
+                    method == symbol['method_name'] and \
+                    match_exact_function(clazz, symbol['class_name'], method, v.lineno):
                     stack_trace = get_formated_stack_trace(v.stack_trace)
                     if (traced_class, method, stack_trace) not in seen:
                         seen.append((traced_class, method, stack_trace))
 
     if interrupted:
-        print(f"{bcolors.OKGREEN}\nStopping the tracer .{bcolors.ENDC}")
+        print(f"{bcolors.OKGREEN}\nStopping the tracer.{bcolors.ENDC}")
         break
 
 print("Generating Report ...")
 if args.save_report == 'csv':
     report_csv = open('arvos-report.csv', 'w')
-    fieldnames = ['ID', 'Vulnerability', 'Vulnerability Detail', 'Invoked Class', 'Invoked Method',
+    fieldnames = ['ID', 'Vulnerability', 'Vulnerability Detail', 'Score', 'Invoked Class', 'Invoked Method',
                   'Github Repository', 'Stacktrace']
     writer = csv.DictWriter(report_csv, fieldnames=fieldnames)
     writer.writeheader()
 
-
+scores = { 'CRITICAL': 0, 'HIGH': 0, 'MEDIUM': 0, 'LOW': 0 }
 for (traced_class, traced_method, stack_trace) in seen:
     for vulnerability in vulnerability_database:
         for symbol in vulnerability['symbols']:
@@ -433,12 +543,18 @@ for (traced_class, traced_method, stack_trace) in seen:
                 elif vulnerability['vulnerability'].startswith('GHSA'):
                     vulnerability_url = f"https://github.com/advisories/{vulnerability['vulnerability']}"
 
+                score = get_vulnerability_score(vulnerability['vulnerability'])
+                if score in scores:
+                    scores[score] += 1
+
                 print(f"\n{bcolors.BOLD}The following vulnerable symbol has been invoked : \n{bcolors.ENDC}")
                 print(f"\t{bcolors.FAIL}{bcolors.BOLD}Vulnerability:{bcolors.ENDC} {vulnerability['vulnerability']}")
                 print(f"\t{bcolors.FAIL}{bcolors.BOLD}Vulnerability Detail:{bcolors.ENDC} {vulnerability_url}")
+                print(f"\t{bcolors.FAIL}{bcolors.BOLD}Score:{bcolors.ENDC} {score}")
                 print(f"\t{bcolors.FAIL}{bcolors.BOLD}Repository:{bcolors.ENDC} https://github.com/{vulnerability['repository']}")
                 print(f"\t{bcolors.FAIL}{bcolors.BOLD}Invoked Class:{bcolors.ENDC} {symbol['class_name']}")
                 print(f"\t{bcolors.FAIL}{bcolors.BOLD}Invoked Method:{bcolors.ENDC} {symbol['method_name']}")
+                print(f"\t{bcolors.FAIL}{bcolors.BOLD}Version Range:{bcolors.ENDC} {get_version_range(vulnerability)}")
                 print(f"\t{bcolors.FAIL}{bcolors.BOLD}Stacktrace:{bcolors.ENDC}")
                 for trace_string in stack_trace:
                     result = re.search(pattern, trace_string)
@@ -455,18 +571,22 @@ for (traced_class, traced_method, stack_trace) in seen:
                         'ID': vuln_count,
                         'Vulnerability': vulnerability['vulnerability'],
                         'Vulnerability Detail': "https://nvd.nist.gov/vuln/detail/" + vulnerability['vulnerability'],
+                        'Score': score,
                         'Invoked Class': symbol['class_name'],
                         'Invoked Method': symbol['method_name'],
-                        'Github Repository': 'https://github.com/' + symbol['repository'],
+                        'Github Repository': 'https://github.com/' + vulnerability['repository'],
                         'Stacktrace': trace_source
                     })
+
 
 if args.save_report == 'csv':
     report_csv.close()
 
-
 if vuln_count != 0:
     print(f"{bcolors.FAIL}[FAIL]{bcolors.ENDC} We found {vuln_count} vulnerable symbols being used in your application.")
+    print(f"{bcolors.FAIL}[FAIL]{bcolors.ENDC} Severities: CRITICAL: {scores['CRITICAL']}, HIGH: {scores['HIGH']}, MEDIUM: {scores['MEDIUM']}, LOW: {scores['LOW']}")
+
     sys.exit(1)
 else:
     print(f"\t{bcolors.OKGREEN}[SUCCESS]{bcolors.ENDC} No vulnerable symbol has been found in your application.")
+    print(f"\t{bcolors.OKGREEN}[SUCCESS]{bcolors.ENDC} Severities: CRITICAL: {scores['CRITICAL']}, HIGH: {scores['HIGH']}, MEDIUM: {scores['MEDIUM']}, LOW: {scores['LOW']}")

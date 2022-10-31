@@ -1,0 +1,155 @@
+[
+    {
+        "vulnerability": "CVE-2021-28658",
+        "repository": "django/django",
+        "symbols": [
+            {
+                "class_name": "django.http.multipartparser.MultiPartParser",
+                "method_name": "parse",
+                "parameters": null,
+                "footprint": "django.http.multipartparser.MultiPartParser.parse"
+            },
+            {
+                "class_name": "django.http.multipartparser.MultiPartParser",
+                "method_name": "IE_sanitize",
+                "parameters": null,
+                "footprint": "django.http.multipartparser.MultiPartParser.IE_sanitize"
+            }
+        ],
+        "language": "python",
+        "model_version": "v0.1.0",
+        "confidence": 50,
+        "spread": -1,
+        "updated_at": "2022-02-15 14:04:00.951407",
+        "cpe_version_range": {
+            "gt": "~",
+            "gte": "3.1.0",
+            "lt": "3.1.8",
+            "lte": "~"
+        },
+        "package_version_range": {
+            "gt": "~",
+            "gte": "3.1.0",
+            "lt": "3.1.8",
+            "lte": "~"
+        }
+    },
+    {
+        "vulnerability": "CVE-2021-31542",
+        "repository": "django/django",
+        "symbols": [
+            {
+                "class_name": "django.http.multipartparser.MultiPartParser",
+                "method_name": "sanitize_file_name",
+                "parameters": null,
+                "footprint": "django.http.multipartparser.MultiPartParser.sanitize_file_name"
+            },
+            {
+                "class_name": "django.utils.text",
+                "method_name": "get_valid_filename",
+                "parameters": null,
+                "footprint": "django.utils.text.get_valid_filename"
+            },
+            {
+                "class_name": "django.core.files.uploadedfile.UploadedFile",
+                "method_name": "_set_name",
+                "parameters": null,
+                "footprint": "django.core.files.uploadedfile.UploadedFile._set_name"
+            },
+            {
+                "class_name": "django.core.files.storage.Storage",
+                "method_name": "get_available_name",
+                "parameters": null,
+                "footprint": "django.core.files.storage.Storage.get_available_name"
+            },
+            {
+                "class_name": "django.core.files.storage.Storage",
+                "method_name": "generate_filename",
+                "parameters": null,
+                "footprint": "django.core.files.storage.Storage.generate_filename"
+            },
+            {
+                "class_name": "django.db.models.fields.files.FileField",
+                "method_name": "generate_filename",
+                "parameters": null,
+                "footprint": "django.db.models.fields.files.FileField.generate_filename"
+            }
+        ],
+        "language": "python",
+        "model_version": "v0.1.0",
+        "confidence": 16,
+        "spread": -1,
+        "updated_at": "2022-02-15 14:04:00.945343",
+        "cpe_version_range": {
+            "gt": "~",
+            "gte": "3.1.0",
+            "lt": "3.1.9",
+            "lte": "~"
+        },
+        "package_version_range": {
+            "gt": "~",
+            "gte": "3.1.0",
+            "lt": "3.1.9",
+            "lte": "~"
+        }
+    },
+    {
+        "vulnerability": "CVE-2021-44420",
+        "repository": "django/django",
+        "symbols": [
+            {
+                "class_name": "django.db.models.base.Model",
+                "method_name": "__getstate__",
+                "parameters": null,
+                "footprint": "django.db.models.base.Model.__getstate__"
+            },
+            {
+                "class_name": "django.db.models.base.Model",
+                "method_name": "__setstate__",
+                "parameters": null,
+                "footprint": "django.db.models.base.Model.__setstate__"
+            },
+            {
+                "class_name": "django.urls.resolvers.RegexPattern",
+                "method_name": "match",
+                "parameters": null,
+                "footprint": "django.urls.resolvers.RegexPattern.match"
+            },
+            {
+                "class_name": "django.urls.resolvers",
+                "method_name": "_route_to_regex",
+                "parameters": null,
+                "footprint": "django.urls.resolvers._route_to_regex"
+            },
+            {
+                "class_name": "djangodocs.DjangoHTMLTranslator",
+                "method_name": "visit_table",
+                "parameters": null,
+                "footprint": "djangodocs.DjangoHTMLTranslator.visit_table"
+            },
+            {
+                "class_name": "djangodocs.DjangoHTMLTranslator",
+                "method_name": "depart_table",
+                "parameters": null,
+                "footprint": "djangodocs.DjangoHTMLTranslator.depart_table"
+            }
+        ],
+        "language": "python",
+        "model_version": "v0.1.0",
+        "confidence": 16,
+        "spread": -1,
+        "updated_at": "2022-02-15 14:04:00.947757",
+        "cpe_version_range": {
+            "gt": "~",
+            "gte": "3.1.0",
+            "lt": "3.1.14",
+            "lte": "~"
+        },
+        "package_version_range": {
+            "gt": "~",
+            "gte": "3.1.0",
+            "lt": "3.1.14",
+            "lte": "~"
+        }
+    }
+]

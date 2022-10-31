@@ -1,0 +1,83 @@
+apiVersion: v1
+kind: Pod
+metadata:
+  name: arvos
+  namespace: gitlab-agent
+  labels:
+    name: arvos
+spec:
+  shareProcessNamespace: true
+  restartPolicy: Never
+  imagePullSecrets:
+  - name: arvos-pull
+  containers:
+  - name: django-app
+    image: harbor.carls.a1ck.io/arvos/user-demo:%DEMO_VERSION%
+    imagePullPolicy: IfNotPresent
+    resources:
+      requests:
+        cpu: 100m
+        memory: 1Gi
+      limits:
+        cpu: 1000m
+        memory: 2Gi
+  - name: tracer-app
+    image: harbor.carls.a1ck.io/arvos/arvos-py:v13
+    command: [ "python_calls.py" ]
+    args: [ "--detect", "/python3 manage.py runserver", 
+            "--trace-period", "2", 
+            "--save-report", "csv", 
+            "--database-file", "arvos_vfs_py_versions.json",
+            "--requirements-file", "/etc/config/requirements.txt" ]
+    imagePullPolicy: IfNotPresent
+    resources:
+      requests:
+        cpu: 100m
+        memory: 1Gi
+        ephemeral-storage: 2Gi
+      limits:
+        cpu: 1000m
+        memory: 2Gi
+    securityContext:
+        privileged: true
+        allowPrivilegeEscalation: true
+        runAsUser: 0
+        runAsGroup: 0
+        capabilities:
+          add:
+            - SYS_ADMIN
+    env:
+    - name: GITHUB_API_TOKEN
+      valueFrom:
+        secretKeyRef:
+          name: github-api-token
+          key: api-token
+          optional: true
+    volumeMounts:
+    - name: requirements
+      mountPath: /etc/config
+    - name: debug
+      mountPath: /sys/kernel/debug
+      readOnly: false
+  volumes:
+  - name: requirements
+    configMap:
+      name: requirements-file
+  - name: debug
+    hostPath:
+      path: /sys/kernel/debug
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: django-app-service
+  namespace: gitlab-agent 
+  labels:
+    app: django-app-service
+spec:
+  type: ClusterIP
+  selector:
+    name: arvos
+  ports:
+  - port: 8000
+    targetPort: 8000
