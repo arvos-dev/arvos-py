@@ -18,7 +18,7 @@ from pip_requirements_parser import RequirementsFile
 
 DOCKER_RUNNING = True if os.environ.get('APP_ENV') == 'docker' else False
 MAX_HTTP_RETRIES = 2
-STACK_COUNT = 256
+STACK_COUNT = 1024
 STACK_SIZE  = 256
 PERIOD = 10
 
@@ -194,7 +194,7 @@ class bcolors:
     BOLD = '\033[1m'
     UNDERLINE = '\033[4m'
 
-parser = argparse.ArgumentParser(description="Summarize method calls in high-level languages.")
+parser = argparse.ArgumentParser(description="Trace Python function calls for vulnerability detection")
 parser.add_argument("pid", type=int, nargs="?", help="process id to attach to")
 parser.add_argument("--detect", type=str, help="automatically fetch pid")
 parser.add_argument("--debug", action="store_true", help="debug mode")
@@ -202,8 +202,12 @@ parser.add_argument('--save-report', default=False, const=False, nargs='?', choi
 parser.add_argument("--database-file", type=str, default='arvos_vfs_py.json', help="Specify database file")
 parser.add_argument("--requirements-file", type=str, help="Provide library version through requirements.txt")
 parser.add_argument("--trace-period", help="Tracing period in minutes (default: Infinite)", type=int, default=sys.maxsize, required=False)
+parser.add_argument("--stack-count", help=f"Number of stacks for stack trace (default: {STACK_COUNT})", type=int, default=STACK_COUNT, required=False)
 
 args = parser.parse_args()
+
+if args.stack_count:
+    STACK_COUNT = args.stack_count
 
 if not args.debug:
     signal.signal(signal.SIGTERM, signal_handler)
@@ -215,7 +219,6 @@ if not args.pid and not args.detect:
 
 if not args.pid and args.detect:
     for i in range(10):
-        "ps ax | grep -v -e 'python_calls.py' -e 'grep' | grep '/python3 manage.py runserver'"
         p1 = subprocess.Popen(['ps', 'ax'], stdout=subprocess.PIPE)
         p2 = subprocess.Popen(['grep', '-v', '-e', 'python_calls.py', '-e', 'grep'], stdin=p1.stdout, stdout=subprocess.PIPE)
         p3 = subprocess.Popen(['grep', args.detect], stdin=p2.stdout, stdout=subprocess.PIPE)
@@ -230,14 +233,11 @@ if not args.pid and args.detect:
         sys.exit(1)
 
 
-stacks_str = ""
-for i in range(STACK_COUNT):
-    stacks_str += f"BPF_ARRAY(array{i}, struct hash_t, {STACK_SIZE});\n"
-
 program = '''
 #define MAX_CLASS_LENGTH  150
 #define MAX_METHOD_LENGTH 100
 DEFINE_STACK_SIZE
+DEFINE_STACK_COUNT
 
 DEFINE_DEBUG
 
@@ -254,19 +254,17 @@ struct method_t {
     int lineno;
 };
 
-struct pid_stack_index {
-    u64 index;
-    int stack_size;
+struct stack_t {
+    u32 stack_size;
+    struct hash_t stack[STACK_SIZE];
 };
 
 BPF_PERCPU_ARRAY(method_t_struct, struct method_t, 1);
 BPF_HASH(counts, struct hash_t, struct method_t);
 
-BPF_HASH(current_stack_index);
-BPF_HASH(pid_id, u64, struct pid_stack_index);
-DEFINE_STACKS
-
-BPF_HASH_OF_MAPS(stack_map, u64, "array0", 256);
+BPF_ARRAY(stack_test, struct stack_t, STACK_COUNT);
+BPF_HASH(stack_index, u32, u32);
+BPF_ARRAY(current_stack_count, u32, 1);
 
 static u32 hash_func(unsigned char *clazz, unsigned char *method, u32 lineno) {
     int c;
@@ -285,42 +283,79 @@ static u32 hash_func(unsigned char *clazz, unsigned char *method, u32 lineno) {
     return hash ^ lineno;
 }
 
-static int push_stack(void *stack, struct pid_stack_index *index, struct hash_t *entry) {
-    if (index->stack_size >= STACK_SIZE - 1) 
+static int push_stack(struct stack_t *stack, struct hash_t *entry) {
+    if (!stack || !entry || stack->stack_size >= STACK_SIZE) 
         return 1;
 
-    index->stack_size++;
+    stack->stack[stack->stack_size] = *entry;
+    stack->stack_size++;
 
-    return bpf_map_update_elem(stack, &index->stack_size, entry, BPF_ANY);
+    return 0;
 }
 
-static void *pop_stack(void *stack, struct pid_stack_index *index) {
-    if (index->stack_size < 0) {
+static void *pop_stack(struct stack_t *stack) {
+    if (!stack || stack->stack_size <= 0)
         return NULL;
-    }
-    
-    struct hash_t *entry = bpf_map_lookup_elem(stack, &index->stack_size);
-    
-    // Don't actually delete elem, just decrease index, next push will overwrite anyways.
-    index->stack_size--;
 
-    return entry;
+    stack->stack_size--;
+
+    return &stack->stack[stack->stack_size + 1];
 }
 
-static void build_stack(void *stack, struct pid_stack_index *index, struct method_t *entry) {
-    for (u64 i = 0; i < STACK_SIZE; i++) {
-        u64 map_i = i;
-        
-        struct hash_t *stack_entry = bpf_map_lookup_elem(stack, &map_i);
-        if (!stack_entry || i > index->stack_size) {
+static void build_stack(struct stack_t *stack, struct method_t *entry) {
+    struct hash_t stack_entry = {0};
+    if (!stack || !entry)
+        return;
+
+    #pragma clang loop unroll(full)
+    for (u32 i = 0; i < STACK_SIZE; i++) 
+    {
+        if (i >= stack->stack_size) {
             entry->stack_trace[i].hash = 0;
             continue;
         }
         
-        bpf_probe_read(&entry->stack_trace[i], sizeof(struct hash_t), stack_entry);
+        bpf_probe_read(&entry->stack_trace[i], sizeof(struct hash_t), &stack->stack[i]);
     }
 }
 
+static void *get_stack(u32 pid) 
+{
+    u32 zero = 0;
+
+    u32 *current_stack_idx = current_stack_count.lookup(&zero);
+    u32 cur_stack_idx = -1;
+    if (current_stack_idx) {
+        cur_stack_idx = *current_stack_idx;
+    }
+
+    u32 *index = stack_index.lookup(&pid);
+    if (!index)
+    {
+        cur_stack_idx++;
+        stack_index.update(&pid, &cur_stack_idx);
+        index = &cur_stack_idx;
+
+        current_stack_count.update(&zero, &cur_stack_idx);
+    }
+    
+    return stack_test.lookup(index);
+}
+
+static void update_stack(u32 pid, void *stack) 
+{
+    u32 zero = 0;
+
+    u32 *current_stack_idx = current_stack_count.lookup(&zero);
+    if (!current_stack_idx)
+        return;
+
+    u32 *index = stack_index.lookup(&pid);
+    if (!index)
+        return;
+    
+    stack_test.update(index, stack);
+}
 
 int trace_entry(struct pt_regs *ctx) {
     u64 clazz = 0, method = 0, zero = 0;
@@ -344,55 +379,20 @@ int trace_entry(struct pt_regs *ctx) {
     
     hash_entry.hash = hash;
     hash_entry.lineno = data->lineno;
-    
-    // Allocate or fetch global stack index
-    u64 *current_stack_idx = current_stack_index.lookup(&zero);
-    u64 new_stack_idx = 0;
-
-    if (!current_stack_idx) {
-        current_stack_index.insert(&zero, &zero);
-    }
-    else {
-        new_stack_idx = *current_stack_idx;
-    }
-
-    /* Allocate or fetch inner pid stack */
-    struct pid_stack_index *pid_stack_index = pid_id.lookup(&data->pid);
-    struct pid_stack_index pid_stack_idx = { .index = 0, .stack_size = -1};
-    
-    if (!pid_stack_index) {
-        // Grab a new stack
-        pid_stack_idx.index = new_stack_idx;
-        pid_id.insert(&data->pid, &pid_stack_idx);
-        if (new_stack_idx < 256) {
-            new_stack_idx++;
-            current_stack_index.update(&zero, &new_stack_idx);
-        }
-    }
-    else {
-        pid_stack_idx = *pid_stack_index;
-    }
-    
-    void *inner_stack = stack_map.lookup(&pid_stack_idx.index);
-    if (!inner_stack)
+    struct stack_t *stack = get_stack(data->pid);
+    if (!stack)
         return 0;
 
+    push_stack(stack, &hash_entry);
 
-    /* Inner stack operations */
+    build_stack(stack, data);
 
-    if (push_stack(inner_stack, &pid_stack_idx, &hash_entry) != 0) {
-        bpf_trace_printk("push error");
-    }
-
-    build_stack(inner_stack, &pid_stack_idx, data);
-
-    pid_id.update(&data->pid, &pid_stack_idx);
     counts.update(&hash_entry, data);
-
+    
+    update_stack(data->pid, stack);
 #ifdef DEBUG
     bpf_trace_printk("Entry: Method: %s", data->method);
     
-    bpf_trace_printk("Stack size: %d", pid_stack_idx.stack_size);
     bpf_trace_printk("");
 #endif
 
@@ -404,64 +404,30 @@ int trace_return(struct pt_regs *ctx) {
     int lineno = 0;
 
     pid = bpf_get_current_pid_tgid();
-
-    u64 *current_stack_idx = current_stack_index.lookup(&zero);
-    u64 new_stack_idx = 0;
-
-    if (!current_stack_idx) {
-        current_stack_index.insert(&zero, &zero);
-    }
-    else {
-        new_stack_idx = *current_stack_idx;
-    }
-
-    /* Allocate or fetch inner pid stack */
-    struct pid_stack_index *pid_stack_index = pid_id.lookup(&pid);
-    struct pid_stack_index pid_stack_idx = { .index = 0, .stack_size = -1};
-    
-    if (!pid_stack_index) {
-        // Grab a new stack
-        pid_stack_idx.index = new_stack_idx;
-        pid_id.insert(&pid, &pid_stack_idx);
-        if (new_stack_idx < 256) {
-            new_stack_idx++;
-            current_stack_index.update(&zero, &new_stack_idx);
-        }
-    }
-    else {
-        pid_stack_idx = *pid_stack_index;
-    }
-    
-    void *inner_stack = stack_map.lookup(&pid_stack_idx.index);
-    if (!inner_stack)
+    struct stack_t *stack = get_stack(pid);
+    if (!stack)
         return 0;
 
-    pop_stack(inner_stack, &pid_stack_idx);
+    pop_stack(stack);
     
-    pid_id.update(&pid, &pid_stack_idx);
+    update_stack(pid, stack);
 
 #ifdef DEBUG
     bpf_trace_printk("Return");
-    bpf_trace_printk("Stack size: %d", pid_stack_idx.stack_size);
     bpf_trace_printk("");
 #endif 
 
     return 0;
 }
 '''.replace('DEFINE_DEBUG', '#define DEBUG' if args.debug else "") \
-    .replace('DEFINE_STACKS', stacks_str) \
-    .replace('DEFINE_STACK_SIZE', f"#define STACK_SIZE {STACK_SIZE}")
+    .replace('DEFINE_STACK_SIZE', f"#define STACK_SIZE {STACK_SIZE}") \
+    .replace('DEFINE_STACK_COUNT', f"#define STACK_COUNT {STACK_COUNT}")
 
 usdt = USDT(pid=args.pid)
 usdt.enable_probe_or_bail("python:function__entry", 'trace_entry')
 usdt.enable_probe_or_bail("python:function__return", 'trace_return')
 
-bpf = BPF(text=program, usdt_contexts=[usdt] if usdt else [])
-
-stack_map = bpf['stack_map']
-for i in range(STACK_COUNT):
-    stack_map[ct.c_int(i)] = ct.c_int(bpf[f"array{i}"].map_fd)
-    
+bpf = BPF(text=program, usdt_contexts=[usdt] if usdt else [], debug=0)
 
 with open(args.database_file) as fp:
     vulnerability_database = json.load(fp)
